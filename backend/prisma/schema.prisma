@@ -1,0 +1,105 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+enum UserRole {
+  ORGANIZER
+  PARTICIPANT
+}
+
+enum QuestionType {
+  TEXT
+  IMAGE
+}
+
+enum AnswerType {
+  SINGLE
+  MULTIPLE
+}
+
+enum QuizSessionStatus {
+  ACTIVE
+  FINISHED
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  password  String
+  role      UserRole
+  name      String
+  createdAt DateTime  @default(now())
+
+  organizedQuizzes Quiz[]
+  quizSessions     QuizSession[]
+
+  @@index([role])
+  @@index([createdAt])
+}
+
+model Quiz {
+  id                Int       @id @default(autoincrement())
+  title             String
+  category          String
+  timePerQuestion   Int
+  showCorrectAnswer Boolean   @default(true)
+  shuffleQuestions  Boolean   @default(false)
+  roomCode          String    @unique
+  organizerId       Int
+  createdAt         DateTime  @default(now())
+
+  organizer User       @relation(fields: [organizerId], references: [id], onDelete: Cascade)
+  questions Question[]
+  sessions  QuizSession[]
+
+  @@index([organizerId])
+  @@index([category])
+  @@index([createdAt])
+}
+
+model Question {
+  id         Int          @id @default(autoincrement())
+  quizId     Int
+  type       QuestionType
+  answerType AnswerType
+  content    String
+  order      Int
+
+  quiz    Quiz     @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  options Option[]
+
+  @@index([quizId])
+  @@index([quizId, order])
+}
+
+model Option {
+  id         Int     @id @default(autoincrement())
+  questionId Int
+  text       String
+  isCorrect  Boolean @default(false)
+
+  question Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@index([questionId])
+}
+
+model QuizSession {
+  id              Int              @id @default(autoincrement())
+  quizId          Int
+  userId          Int?
+  participantName String
+  score           Int              @default(0)
+  status          QuizSessionStatus @default(ACTIVE)
+
+  quiz Quiz @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([quizId])
+  @@index([userId])
+  @@index([status])
+  @@index([quizId, score])
+}
