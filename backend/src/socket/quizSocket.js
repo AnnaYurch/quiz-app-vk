@@ -4,8 +4,6 @@ import { prisma } from "../lib/prisma.js";
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
 const DEFAULT_POINTS = 10;
 
-// Храним состояние комнаты в памяти процесса.
-// Для MVP это самый простой способ отслеживать текущий вопрос и не пускать ответы вне активного экрана.
 const roomState = new Map();
 
 const getRoomState = (roomCode, quizId) => {
@@ -18,9 +16,10 @@ const getRoomState = (roomCode, quizId) => {
       answeredSessions: new Map(),
       participants: new Map(),
       organizerSocketId: null,
+      timerTimeout: null,
+      timePerQuestion: 30,
     });
   }
-
   return roomState.get(roomCode);
 };
 
@@ -37,6 +36,21 @@ const sanitizeQuestion = (question) => ({
   })),
 });
 
+// Полный вопрос с правильными ответами — отправляется только после истечения времени
+const sanitizeQuestionWithAnswers = (question) => ({
+  id: question.id,
+  quizId: question.quizId,
+  type: question.type,
+  answerType: question.answerType,
+  content: question.content,
+  order: question.order,
+  options: question.options.map((option) => ({
+    id: option.id,
+    text: option.text,
+    isCorrect: option.isCorrect,
+  })),
+});
+
 const buildLeaderboard = async (quizId) => {
   const sessions = await prisma.quizSession.findMany({
     where: { quizId },
@@ -49,7 +63,6 @@ const buildLeaderboard = async (quizId) => {
       userId: true,
     },
   });
-
   return sessions;
 };
 
@@ -58,9 +71,7 @@ const getCurrentQuestion = async (quizId, currentIndex) => {
     where: { id: quizId },
     include: {
       questions: {
-        include: {
-          options: true,
-        },
+        include: { options: true },
         orderBy: { order: "asc" },
       },
     },
@@ -70,22 +81,15 @@ const getCurrentQuestion = async (quizId, currentIndex) => {
     return { quiz, question: null };
   }
 
-  return {
-    quiz,
-    question: quiz.questions[currentIndex] || null,
-  };
+  return { quiz, question: quiz.questions[currentIndex] || null };
 };
 
 const verifySocketUser = (socket) => {
   const token = socket.handshake.auth?.token;
-
-  if (!token) {
-    return null;
-  }
-
+  if (!token) return null;
   try {
     return jwt.verify(token, JWT_SECRET);
-  } catch (error) {
+  } catch {
     return null;
   }
 };
@@ -97,10 +101,9 @@ const emitLeaderboard = async (io, roomCode, quizId) => {
 };
 
 const emitParticipants = (io, roomCode, state) => {
-  const participants = Array.from(state.participants.values()).sort((first, second) =>
-    first.participantName.localeCompare(second.participantName)
+  const participants = Array.from(state.participants.values()).sort((a, b) =>
+    a.participantName.localeCompare(b.participantName)
   );
-
   io.to(roomCode).emit("participants_update", participants);
   return participants;
 };
@@ -110,62 +113,86 @@ const loadQuizByPayload = async (payloadRoomCode, payloadQuizId) => {
     return prisma.quiz.findUnique({
       where: { id: Number(payloadQuizId) },
       include: {
-        questions: {
-          include: { options: true },
-          orderBy: { order: "asc" },
-        },
+        questions: { include: { options: true }, orderBy: { order: "asc" } },
       },
     });
   }
-
   if (payloadRoomCode) {
     return prisma.quiz.findUnique({
       where: { roomCode: payloadRoomCode },
       include: {
-        questions: {
-          include: { options: true },
-          orderBy: { order: "asc" },
-        },
+        questions: { include: { options: true }, orderBy: { order: "asc" } },
       },
     });
   }
-
   return null;
+};
+
+// Запускает серверный таймер для текущего вопроса.
+// По истечении времени рассылает quiz_time_up с правильными ответами.
+const startQuestionTimer = (io, roomCode, quiz, state, question, questionIndex) => {
+  // Сбрасываем предыдущий таймер, если был
+  if (state.timerTimeout) {
+    clearTimeout(state.timerTimeout);
+    state.timerTimeout = null;
+  }
+
+  const seconds = state.timePerQuestion || quiz.timePerQuestion || 30;
+
+  // Сообщаем всем в комнате метку времени окончания, чтобы клиенты
+  // могли рисовать обратный отсчёт независимо и синхронно
+  const endsAt = Date.now() + seconds * 1000;
+  io.to(roomCode).emit("timer_start", { endsAt, seconds });
+
+  state.timerTimeout = setTimeout(async () => {
+    try {
+      // Достаём вопрос свежо из БД, чтобы получить isCorrect
+      const fresh = await prisma.question.findUnique({
+        where: { id: question.id },
+        include: { options: true },
+      });
+
+      if (fresh) {
+        io.to(roomCode).emit("quiz_time_up", {
+          questionId: fresh.id,
+          questionIndex,
+          question: sanitizeQuestionWithAnswers(fresh),
+        });
+      }
+
+      await emitLeaderboard(io, roomCode, state.quizId);
+    } catch (err) {
+      console.error("timer error", err);
+    }
+  }, seconds * 1000);
 };
 
 export const initSocket = (io) => {
   io.use((socket, next) => {
-    // Если клиент передал JWT в handshake.auth.token, сохраним пользователя в socket.data.
-    // Это нужно, чтобы организатор мог запускать квиз через socket без отдельного HTTP-запроса.
     socket.data.user = verifySocketUser(socket);
     next();
   });
 
   io.on("connection", (socket) => {
-    // Участник входит в комнату по 6-значному roomCode и получает отдельную запись QuizSession.
+
     socket.on("join_room", async (payload, callback) => {
       try {
         const { roomCode, participantName, isOrganizer } = payload || {};
 
         if (!roomCode) {
-          const error = { message: "roomCode обязателен" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "roomCode обязателен" });
           return;
         }
 
         const quiz = await prisma.quiz.findUnique({
           where: { roomCode },
           include: {
-            questions: {
-              include: { options: true },
-              orderBy: { order: "asc" },
-            },
+            questions: { include: { options: true }, orderBy: { order: "asc" } },
           },
         });
 
         if (!quiz) {
-          const error = { message: "Квиз с таким кодом комнаты не найден" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Квиз с таким кодом комнаты не найден" });
           return;
         }
 
@@ -176,18 +203,17 @@ export const initSocket = (io) => {
         await socket.join(roomCode);
 
         const state = getRoomState(roomCode, quiz.id);
+        state.timePerQuestion = quiz.timePerQuestion;
 
         if (isOrganizer) {
           state.organizerSocketId = socket.id;
           roomState.set(roomCode, state);
-
           if (callback) callback({ ok: true, quizId: quiz.id, roomCode, isOrganizer: true });
           return;
         }
 
         if (!participantName) {
-          const error = { message: "participantName обязателен" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "participantName обязателен" });
           return;
         }
 
@@ -220,13 +246,26 @@ export const initSocket = (io) => {
         io.to(roomCode).emit("participant_joined", participant);
         emitParticipants(io, roomCode, state);
 
+        // Если квиз уже идёт — сразу отправляем текущий вопрос и таймер
+        if (state.started && !state.finished && state.currentQuestionIndex >= 0) {
+          const { question } = await getCurrentQuestion(quiz.id, state.currentQuestionIndex);
+          if (question) {
+            socket.emit("quiz_started", {
+              roomCode,
+              quizId: quiz.id,
+              question: sanitizeQuestion(question),
+              questionIndex: state.currentQuestionIndex,
+              totalQuestions: quiz.questions.length,
+            });
+          }
+        }
+
         if (callback) callback({ ok: true, sessionId: session.id, quizId: quiz.id });
-      } catch (error) {
+      } catch {
         if (callback) callback({ message: "Не удалось войти в комнату" });
       }
     });
 
-    // Организатор запускает квиз и получает первый вопрос.
     socket.on("start_quiz", async (payload, callback) => {
       try {
         const { roomCode: payloadRoomCode, quizId: payloadQuizId } = payload || {};
@@ -234,76 +273,59 @@ export const initSocket = (io) => {
         const quizId = payloadQuizId ? Number(payloadQuizId) : socket.data.quizId;
 
         if (!roomCode && !quizId) {
-          const error = { message: "roomCode или quizId обязателен" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "roomCode или quizId обязателен" });
           return;
         }
 
         const quiz = await loadQuizByPayload(roomCode, quizId);
 
         if (!quiz) {
-          const error = { message: "Квиз не найден" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Квиз не найден" });
           return;
         }
 
         if (socket.data.user?.role !== "ORGANIZER" || socket.data.user?.id !== quiz.organizerId) {
-          const error = { message: "Только организатор этого квиза может запускать игру" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Только организатор этого квиза может запускать игру" });
           return;
         }
 
         if (quiz.questions.length === 0) {
-          const error = { message: "Нельзя запустить квиз без вопросов" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Нельзя запустить квиз без вопросов" });
           return;
         }
 
-        const state = roomState.get(roomCode) || {
-          quizId: quiz.id,
-          currentQuestionIndex: -1,
-          started: false,
-          finished: false,
-          answeredSessions: new Map(),
-        };
-
+        const state = getRoomState(roomCode, quiz.id);
         state.quizId = quiz.id;
         state.currentQuestionIndex = 0;
         state.started = true;
         state.finished = false;
         state.answeredSessions = new Map();
+        state.timePerQuestion = quiz.timePerQuestion;
         roomState.set(roomCode, state);
 
-        const question = sanitizeQuestion(quiz.questions[0]);
+        const question = quiz.questions[0];
+        const sanitized = sanitizeQuestion(question);
 
-        // Важно: на клиент отправляем только текст вариантов ответа без isCorrect.
-        // Это защищает игру от прямого просмотра правильных вариантов в DevTools.
+        // Отправляем только quiz_started — убираем дублирование new_question
         io.to(roomCode).emit("quiz_started", {
           roomCode,
           quizId: quiz.id,
-          question,
-          questionIndex: 0,
-          totalQuestions: quiz.questions.length,
-        });
-
-        io.to(roomCode).emit("new_question", {
-          roomCode,
-          quizId: quiz.id,
-          question,
+          question: sanitized,
           questionIndex: 0,
           totalQuestions: quiz.questions.length,
         });
 
         await emitLeaderboard(io, roomCode, quiz.id);
 
+        // Запускаем таймер после рассылки вопроса
+        startQuestionTimer(io, roomCode, quiz, state, question, 0);
+
         if (callback) callback({ ok: true });
-      } catch (error) {
+      } catch {
         if (callback) callback({ message: "Не удалось запустить квиз" });
       }
     });
 
-    // Проверяем ответ только относительно текущего вопроса комнаты.
-    // Если участник прислал ответ слишком рано или слишком поздно, сервер его не засчитывает.
     socket.on("submit_answer", async (payload, callback) => {
       try {
         const { questionId, selectedOptionIds } = payload || {};
@@ -312,29 +334,26 @@ export const initSocket = (io) => {
         const sessionId = socket.data.quizSessionId;
 
         if (!roomCode || !quizId || !sessionId) {
-          const error = { message: "Сначала участник должен войти в комнату" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Сначала участник должен войти в комнату" });
           return;
         }
 
         const state = roomState.get(roomCode);
 
         if (!state || !state.started || state.finished) {
-          const error = { message: "Квиз не активен" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Квиз не активен" });
           return;
         }
 
         const { quiz, question } = await getCurrentQuestion(quizId, state.currentQuestionIndex);
 
         if (!question || question.id !== Number(questionId)) {
-          const error = { message: "Сейчас идет другой вопрос" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Сейчас идет другой вопрос" });
           return;
         }
 
         const selectedIds = Array.isArray(selectedOptionIds)
-          ? selectedOptionIds.map((optionId) => Number(optionId))
+          ? selectedOptionIds.map((id) => Number(id))
           : [];
 
         const isCorrect = question.options.every((option) => {
@@ -342,11 +361,9 @@ export const initSocket = (io) => {
           return option.isCorrect ? wasSelected : !wasSelected;
         });
 
-        // Защита от повторной отправки ответа на тот же вопрос одним и тем же участником.
         const answeredQuestions = state.answeredSessions.get(sessionId) || new Set();
         if (answeredQuestions.has(question.id)) {
-          const error = { message: "Ответ на этот вопрос уже был отправлен" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Ответ на этот вопрос уже был отправлен" });
           return;
         }
 
@@ -356,29 +373,18 @@ export const initSocket = (io) => {
         if (isCorrect) {
           await prisma.quizSession.update({
             where: { id: sessionId },
-            data: {
-              score: {
-                increment: DEFAULT_POINTS,
-              },
-            },
+            data: { score: { increment: DEFAULT_POINTS } },
           });
         }
 
         await emitLeaderboard(io, roomCode, quizId);
 
-        if (callback) {
-          callback({
-            ok: true,
-            isCorrect,
-            pointsAwarded: isCorrect ? DEFAULT_POINTS : 0,
-          });
-        }
-      } catch (error) {
+        if (callback) callback({ ok: true, isCorrect, pointsAwarded: isCorrect ? DEFAULT_POINTS : 0 });
+      } catch {
         if (callback) callback({ message: "Не удалось обработать ответ" });
       }
     });
 
-    // Переход к следующему вопросу. Сервер сам вычисляет актуальный вопрос и снова скрывает isCorrect.
     socket.on("next_question", async (payload, callback) => {
       try {
         const { roomCode: payloadRoomCode, quizId: payloadQuizId } = payload || {};
@@ -386,70 +392,65 @@ export const initSocket = (io) => {
         const quizId = payloadQuizId ? Number(payloadQuizId) : socket.data.quizId;
 
         if (!roomCode && !quizId) {
-          const error = { message: "roomCode или quizId обязателен" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "roomCode или quizId обязателен" });
           return;
         }
 
         const quiz = await loadQuizByPayload(roomCode, quizId);
 
         if (!quiz) {
-          const error = { message: "Квиз не найден" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Квиз не найден" });
           return;
         }
 
         if (socket.data.user?.role !== "ORGANIZER" || socket.data.user?.id !== quiz.organizerId) {
-          const error = { message: "Только организатор может переключать вопросы" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Только организатор может переключать вопросы" });
           return;
         }
 
         const state = roomState.get(roomCode);
 
         if (!state || !state.started || state.finished) {
-          const error = { message: "Квиз еще не запущен или уже завершен" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Квиз еще не запущен или уже завершен" });
           return;
         }
 
         const nextIndex = state.currentQuestionIndex + 1;
 
         if (nextIndex >= quiz.questions.length) {
-          const error = { message: "Вопросы закончились. Завершите квиз через end_quiz." };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Вопросы закончились. Завершите квиз через end_quiz." });
           return;
+        }
+
+        // Сбрасываем таймер предыдущего вопроса
+        if (state.timerTimeout) {
+          clearTimeout(state.timerTimeout);
+          state.timerTimeout = null;
         }
 
         state.currentQuestionIndex = nextIndex;
         state.answeredSessions = new Map();
         roomState.set(roomCode, state);
 
-        const nextQuestion = sanitizeQuestion(quiz.questions[nextIndex]);
-
-        io.to(roomCode).emit("next_question", {
-          roomCode,
-          quizId: quiz.id,
-          question: nextQuestion,
-          questionIndex: nextIndex,
-          totalQuestions: quiz.questions.length,
-        });
+        const nextQuestion = quiz.questions[nextIndex];
+        const sanitized = sanitizeQuestion(nextQuestion);
 
         io.to(roomCode).emit("new_question", {
           roomCode,
           quizId: quiz.id,
-          question: nextQuestion,
+          question: sanitized,
           questionIndex: nextIndex,
           totalQuestions: quiz.questions.length,
         });
 
+        startQuestionTimer(io, roomCode, quiz, state, nextQuestion, nextIndex);
+
         if (callback) callback({ ok: true });
-      } catch (error) {
+      } catch {
         if (callback) callback({ message: "Не удалось перейти к следующему вопросу" });
       }
     });
 
-    // Завершение квиза закрывает все активные сессии и отправляет финальную таблицу лидеров.
     socket.on("end_quiz", async (payload, callback) => {
       try {
         const { roomCode: payloadRoomCode, quizId: payloadQuizId } = payload || {};
@@ -457,66 +458,54 @@ export const initSocket = (io) => {
         const quizId = payloadQuizId ? Number(payloadQuizId) : socket.data.quizId;
 
         if (!roomCode && !quizId) {
-          const error = { message: "roomCode или quizId обязателен" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "roomCode или quizId обязателен" });
           return;
         }
 
         const quiz = await loadQuizByPayload(roomCode, quizId);
 
         if (!quiz) {
-          const error = { message: "Квиз не найден" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Квиз не найден" });
           return;
         }
 
         if (socket.data.user?.role !== "ORGANIZER" || socket.data.user?.id !== quiz.organizerId) {
-          const error = { message: "Только организатор может завершать квиз" };
-          if (callback) callback(error);
+          if (callback) callback({ message: "Только организатор может завершать квиз" });
           return;
         }
 
+        const state = roomState.get(roomCode);
+        if (state?.timerTimeout) {
+          clearTimeout(state.timerTimeout);
+          state.timerTimeout = null;
+        }
+
         await prisma.quizSession.updateMany({
-          where: {
-            quizId: quiz.id,
-            status: "ACTIVE",
-          },
-          data: {
-            status: "FINISHED",
-          },
+          where: { quizId: quiz.id, status: "ACTIVE" },
+          data: { status: "FINISHED" },
         });
 
         const leaderboard = await emitLeaderboard(io, roomCode, quiz.id);
 
-        const state = roomState.get(roomCode);
         if (state) {
           state.finished = true;
           roomState.set(roomCode, state);
         }
 
-        io.to(roomCode).emit("quiz_finished", {
-          roomCode,
-          leaderboard,
-        });
+        io.to(roomCode).emit("quiz_finished", { roomCode, leaderboard });
 
         if (callback) callback({ ok: true });
-      } catch (error) {
+      } catch {
         if (callback) callback({ message: "Не удалось завершить квиз" });
       }
     });
 
     socket.on("disconnect", async () => {
       const roomCode = socket.data.roomCode;
-
-      if (!roomCode) {
-        return;
-      }
+      if (!roomCode) return;
 
       const state = roomState.get(roomCode);
-
-      if (!state) {
-        return;
-      }
+      if (!state) return;
 
       if (socket.data.isOrganizer) {
         state.organizerSocketId = null;
